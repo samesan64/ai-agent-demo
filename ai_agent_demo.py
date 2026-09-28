@@ -17,12 +17,15 @@ python -m streamlit run ai_agent_demo.py
 """
 
 import ast
+import base64
 import operator
 import os
 
 import streamlit as st
 from anthropic import Anthropic
 import anthropic
+
+from access_control import UsageStore, verify_code
 
 # ---- APIキー設定 ----
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -48,6 +51,18 @@ USD_TO_JPY_RATE = 150               # 大まかな円換算レート(実際の�
 MAX_AGENT_LOOP_STEPS = 5            # 1回の依頼につき、道具を使ってよい最大の往復回数
 MAX_API_RETRIES = 3                 # API呼び出しが失敗した時の再試行回数
 MAX_UPLOAD_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 添付ファイルの上限サイズ(5MB)。大きすぎるファイルはコスト・処理時間の暴走を招くため制限する
+
+USAGE_FILE_PATH = "usage_counts.json"  # 購入者ごとの使用回数を記録するファイル(実行時に自動で作られる)
+MAX_LOGIN_ATTEMPTS = 5                  # ログインに失敗できる回数(超えると、そのセッションではログイン不可にする)
+
+# 画像添付(Vision機能)で受け付ける拡張子と、Claude APIに渡すmedia_typeの対応表
+IMAGE_EXTENSION_TO_MEDIA_TYPE = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 
 # =========================================================
@@ -824,6 +839,81 @@ def run_agent_step(messages: list, log: list, system_prompt: str = "", budget_jp
 st.set_page_config(page_title="AI Agent チャット", page_icon="🤖")
 
 st.title("🤖 AI Agent チャット")
+
+
+# ---- ログイン(アクセスコード)と使用回数の管理 ----
+def _get_secret(name: str, default=None):
+    """Secretsから値を読む。secrets.tomlが存在しない環境でも例外を出さず、defaultを返す。"""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+@st.cache_resource
+def get_usage_store() -> UsageStore:
+    """使用回数の記録係。cache_resourceにより、全ての利用者の間で同じ1つを共有する(排他制御のため)。"""
+    return UsageStore(USAGE_FILE_PATH)
+
+
+def require_access():
+    """
+    アクセスコードを確認する。ログインできていない間は、ここでページの表示を止める。
+    戻り値: ログイン済みの情報(AccessInfo)。認証が未設定の開発モードでは None。
+
+    Secretsの設定例:
+        ADMIN_CODE = "自分用のコード"        ← 回数無制限
+        [ACCESS_CODES]
+        "購入者Aさん用のコード" = 20          ← このコードは20回まで
+    """
+    access_codes = dict(_get_secret("ACCESS_CODES", {}) or {})
+    admin_code = str(_get_secret("ADMIN_CODE", "") or "")
+
+    if not access_codes and not admin_code:
+        st.warning("⚠️ アクセスコードが設定されていません(開発モード)。誰でも使える状態です。公開する前にSecretsを設定してください。")
+        return None
+
+    if st.session_state.get("access_info"):
+        return st.session_state.access_info
+
+    if st.session_state.get("login_failures", 0) >= MAX_LOGIN_ATTEMPTS:
+        st.error("ログインの失敗が続いたため、この画面からはログインできません。時間をおいて、ブラウザを開き直してください。")
+        st.stop()
+
+    st.write("ご利用には、アクセスコードが必要です。")
+    with st.form("login_form"):
+        entered = st.text_input("アクセスコード", type="password")
+        submitted = st.form_submit_button("ログイン")
+    if submitted:
+        info = verify_code(entered, access_codes, admin_code)
+        if info is not None:
+            st.session_state.access_info = info
+            st.session_state.login_failures = 0
+            st.rerun()
+        st.session_state.login_failures = st.session_state.get("login_failures", 0) + 1
+        st.error("アクセスコードが正しくありません。")
+    st.stop()
+
+
+access = require_access()
+usage_store = get_usage_store()
+remaining_slot = st.empty()  # 残り回数の表示場所(処理のあとで書き換えられるよう、場所だけ先に確保する)
+
+
+def show_remaining_uses() -> None:
+    if access is None:
+        return
+    if access.limit is None:
+        remaining_slot.caption("🔑 管理者モード(回数制限なし)")
+        return
+    try:
+        remaining = max(access.limit - usage_store.get_used(access.code_id), 0)
+        remaining_slot.caption(f"🔑 残り使用回数: {remaining}回 / {access.limit}回")
+    except OSError:
+        remaining_slot.caption("🔑 残り使用回数を取得できませんでした")
+
+
+show_remaining_uses()
 st.write("会話を続けながら、AIが必要な道具を自分で選んで実行します。前のやり取りも覚えています。")
 
 # 初めて使う人向けのガイド(まだ会話が始まっていない時だけ表示)
@@ -920,12 +1010,17 @@ if st.button("🔄 会話をリセット"):
     st.session_state.tool_logs = {}
     st.rerun()
 
-# ファイルアップロード(.txt / .pdf)
-uploaded_file = st.file_uploader("📎 ファイルを添付する(.txt / .pdf)", type=["txt", "pdf"])
+# ファイルアップロード(.txt / .pdf / 画像)
+uploaded_file = st.file_uploader(
+    "📎 ファイルを添付する(.txt / .pdf / 画像: png・jpg・gif・webp)",
+    type=["txt", "pdf", "png", "jpg", "jpeg", "gif", "webp"],
+)
 
 # 「このファイルは、次の1回のメッセージにだけ添付する」という状態を管理する
 if "pending_attachment" not in st.session_state:
     st.session_state.pending_attachment = None
+if "pending_image" not in st.session_state:
+    st.session_state.pending_image = None
 
 if uploaded_file is not None:
     # ファイルサイズの上限チェック(大きすぎるファイルは処理時間・トークン費用の暴走につながる)
@@ -936,8 +1031,20 @@ if uploaded_file is not None:
         )
     # 同じファイルを何度も読み込み直さないよう、ファイル名で重複チェック
     elif st.session_state.get("last_uploaded_name") != uploaded_file.name:
+        file_ext = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else ""
         try:
-            if uploaded_file.name.endswith(".pdf"):
+            if file_ext in IMAGE_EXTENSION_TO_MEDIA_TYPE:
+                # 画像は「道具」ではなく、Claudeのvision機能でメッセージに直接埋め込むため、
+                # テキスト添付(pending_attachment)とは別に、base64エンコードした状態で保持しておく
+                image_bytes = uploaded_file.read()
+                st.session_state.pending_image = {
+                    "media_type": IMAGE_EXTENSION_TO_MEDIA_TYPE[file_ext],
+                    "data_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                }
+                st.session_state.last_uploaded_name = uploaded_file.name
+                st.image(image_bytes, caption=uploaded_file.name, width=200)
+                st.info(f"🖼️ 「{uploaded_file.name}」を読み込みました。次のメッセージに1回だけ添付されます。")
+            elif file_ext == "pdf":
                 from pypdf import PdfReader
                 reader = PdfReader(uploaded_file)
                 page_texts = []
@@ -948,21 +1055,51 @@ if uploaded_file is not None:
                         # 1ページだけ読み込みに失敗しても、他のページは読み込みを続ける
                         page_texts.append(f"[{page_number}ページ目の読み込みに失敗しました]")
                 file_text = "\n".join(page_texts)
+                st.session_state.pending_attachment = file_text
+                st.session_state.last_uploaded_name = uploaded_file.name
+                st.info(f"📄 「{uploaded_file.name}」を読み込みました({len(file_text)}文字)。次のメッセージに1回だけ添付されます。")
             else:
                 file_text = uploaded_file.read().decode("utf-8", errors="ignore")
-
-            st.session_state.pending_attachment = file_text
-            st.session_state.last_uploaded_name = uploaded_file.name
-            st.info(f"📄 「{uploaded_file.name}」を読み込みました({len(file_text)}文字)。次のメッセージに1回だけ添付されます。")
+                st.session_state.pending_attachment = file_text
+                st.session_state.last_uploaded_name = uploaded_file.name
+                st.info(f"📄 「{uploaded_file.name}」を読み込みました({len(file_text)}文字)。次のメッセージに1回だけ添付されます。")
         except Exception as e:
             st.error(f"⚠️ ファイルの読み込みに失敗しました: {e}")
+
+def _is_vision_message(content) -> bool:
+    """
+    ユーザーメッセージのcontentが「画像+テキスト」形式(visionメッセージ)かどうかを判定する。
+    role=userのcontentには、道具の実行結果(tool_result)のリストが入ることもあるため、
+    それと区別するために、中身が text/image ブロックかどうかを見る。
+    """
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") in ("text", "image") for b in content
+    )
+
+
+def _user_message_parts(content):
+    """
+    ユーザーメッセージのcontentから、画面表示用のテキストと画像データ(あれば)を取り出す。
+    contentは、通常は文字列(テキストのみ)だが、画像添付があった場合はリスト形式になる。
+    """
+    if isinstance(content, str):
+        return content, None
+    text = "\n".join(b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text")
+    image_block = next((b for b in content if isinstance(b, dict) and b.get("type") == "image"), None)
+    image_bytes = base64.b64decode(image_block["source"]["data"]) if image_block else None
+    return text, image_bytes
+
 
 # 会話をファイルに保存する機能(ポートフォリオ用の証拠としても使える)
 if st.session_state.messages:
     export_lines = ["# AI Agent 会話ログ\n"]
     for msg in st.session_state.messages:
-        if msg["role"] == "user" and isinstance(msg["content"], str):
-            export_lines.append(f"**あなた:** {msg['content']}\n")
+        if msg["role"] == "user" and (isinstance(msg["content"], str) or _is_vision_message(msg["content"])):
+            text, image_bytes = _user_message_parts(msg["content"])
+            line = f"**あなた:** {text}"
+            if image_bytes:
+                line += "(画像添付)"
+            export_lines.append(line + "\n")
         elif msg["role"] == "assistant":
             text_parts = [b.text for b in msg["content"] if getattr(b, "type", None) == "text" and b.text.strip()]
             if text_parts:
@@ -978,9 +1115,13 @@ if st.session_state.messages:
 
 # これまでの会話を画面に表示する(道具の実行過程は隠し、最終回答だけ見せる)
 for idx, msg in enumerate(st.session_state.messages):
-    if msg["role"] == "user" and isinstance(msg["content"], str):
+    if msg["role"] == "user" and (isinstance(msg["content"], str) or _is_vision_message(msg["content"])):
+        text, image_bytes = _user_message_parts(msg["content"])
         with st.chat_message("user"):
-            st.write(msg["content"])
+            if image_bytes:
+                st.image(image_bytes, width=250)
+            if text:
+                st.write(text)
     elif msg["role"] == "assistant":
         text_parts = [b.text for b in msg["content"] if getattr(b, "type", None) == "text" and b.text.strip()]
         if text_parts:
@@ -1010,19 +1151,53 @@ if st.session_state.get("pending_example"):
     st.session_state.pending_example = None
 
 if user_input:
+    # 購入者の場合は、処理を始める前に使用回数を1回分使う(上限に達していたら、ここで止める)
+    consumed_usage = False
+    if access is not None and access.limit is not None:
+        try:
+            allowed = usage_store.try_consume(access.code_id, access.limit)
+        except OSError:
+            st.error("⚠️ 使用回数を記録できなかったため、処理を中止しました。お手数ですが、出品者にご連絡ください。")
+            st.stop()
+        if not allowed:
+            st.error("⚠️ 使用回数の上限に達しました。引き続きご利用の場合は、出品者にご相談ください。")
+            st.stop()
+        consumed_usage = True
+        show_remaining_uses()
+
     with st.chat_message("user"):
         st.write(user_input)
 
     # 添付ファイルがあれば、依頼文の後ろに自動でくっつけてAIに渡す(1回使ったら消す)
-    message_for_ai = user_input
+    message_text = user_input
     if st.session_state.pending_attachment:
-        message_for_ai += f"\n\n【添付ファイルの内容】\n{st.session_state.pending_attachment}"
+        message_text += f"\n\n【添付ファイルの内容】\n{st.session_state.pending_attachment}"
         st.session_state.pending_attachment = None  # 使い終わったので消す(次回からは添付されない)
+
+    if st.session_state.pending_image:
+        # 画像は「道具」ではなく、Claudeのvision機能を使ってメッセージに直接埋め込む。
+        # ドキュメント上の推奨に従い、画像ブロックをテキストより前に置く。
+        image_info = st.session_state.pending_image
+        message_for_ai = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_info["media_type"],
+                    "data": image_info["data_base64"],
+                },
+            },
+            {"type": "text", "text": message_text},
+        ]
+        st.session_state.pending_image = None  # 使い終わったので消す(次回からは添付されない)
+    else:
+        message_for_ai = message_text
 
     st.session_state.messages.append({"role": "user", "content": message_for_ai})
 
     log = []
     st.session_state.generated_charts = []  # 今回の依頼で作るグラフを入れる場所をリセット
+    run_succeeded = False
     with st.chat_message("assistant"):
         with st.spinner("考え中..."):
             try:
@@ -1062,6 +1237,7 @@ if user_input:
                     mime="text/markdown",
                     key=f"download_latest_{len(st.session_state.messages)}",
                 )
+                run_succeeded = True
             except anthropic.AuthenticationError:
                 st.error("⚠️ APIキーが正しくないか、無効になっています。設定を確認してください。")
             except anthropic.RateLimitError:
@@ -1070,3 +1246,11 @@ if user_input:
                 st.error("⚠️ APIへの接続に失敗しました。通信環境を確認し、もう一度お試しください。")
             except Exception as e:
                 st.error(f"⚠️ エラーが発生しました: {e}")
+
+    # 処理が失敗した場合は、購入者が損をしないよう、使った1回分を戻す
+    if consumed_usage and not run_succeeded:
+        try:
+            usage_store.refund(access.code_id)
+        except OSError:
+            pass
+        show_remaining_uses()
